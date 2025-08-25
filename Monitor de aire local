@@ -1,0 +1,175 @@
+// Librerías
+#include "virtuabotixRTC.h"
+#include <SparkFunCCS811.h>
+#include <ClosedCube_HDC1080.h>
+#include <Wire.h>
+#include <BH1750.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Definición de pines ESP32 según tu tabla
+#define CCS811_ADDR 0x5A    // Alternate I2C Address
+
+// Pines para RTC DS1302 (con level shifter)
+#define RTC_CLK_PIN 27
+#define RTC_DAT_PIN 14
+#define RTC_RST_PIN 26
+
+// Pin para DS18B20
+#define ONE_WIRE_BUS 15
+
+// Pin para MQ-7 (analógico)
+#define MQ7_ANALOG_PIN 34
+
+// Pines I2C
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// Parámetros del divisor de voltaje MQ-7
+const float R1 = 2200.0;  // Resistencia de 2.2k en serie
+const float R2 = 3300.0;  // Resistencia de 3.3k a tierra
+const float RL = 1000.0;  // Resistencia de carga del MQ-7 (1k)
+const float VCC_MQ7 = 5.0; // Voltaje de alimentación del MQ-7
+
+// Valores de calibración del MQ-7
+const float RS_BASE_LINE = 214.6;   // Ajustar según tu calibración
+const float CO_BASE_LINE = 400.0;   // Aire limpio (ppm)
+
+// Objetos
+virtuabotixRTC myRTC(RTC_CLK_PIN, RTC_DAT_PIN, RTC_RST_PIN);
+CCS811 myCCS811(CCS811_ADDR);
+ClosedCube_HDC1080 myHDC1080;
+OneWire oneWireObjeto(ONE_WIRE_BUS);
+DallasTemperature sensorDS18B20(&oneWireObjeto);
+BH1750 lightMeter;
+
+// Variables de sensores
+float tempC = 0;
+float hum = 0;
+int co2 = 0;
+int tvoc = 0;
+double co = 0;
+float lux = 0;
+float Rs = 0;
+float temp2 = 0;
+
+// Flags
+bool ccs811Available = false;
+bool hdc1080Available = false;
+bool bh1750Available = false;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  pinMode(MQ7_ANALOG_PIN, INPUT);
+
+  // Inicializar sensores
+  initializeSensors();
+
+  Serial.println(F("===== Monitor Ambiental ESP32 ====="));
+  Serial.println(F("Fecha,Hora,Temp(C),HR(%),CO2(ppm),tVOC(ppb),CO(ppm),Luz(lx),Temp2(C)"));
+}
+
+void initializeSensors() {
+  Serial.println("Inicializando sensores...");
+  
+  // BH1750
+  if (checkI2CDevice(0x23)) {
+    lightMeter.begin();
+    bh1750Available = true;
+    Serial.println(F("BH1750 inicializado"));
+  } else {
+    Serial.println(F("BH1750 no detectado"));
+  }
+  
+  // HDC1080
+  if (checkI2CDevice(0x40)) {
+    myHDC1080.begin(0x40);
+    hdc1080Available = true;
+    Serial.println(F("HDC1080 inicializado"));
+  } else {
+    Serial.println(F("HDC1080 no detectado"));
+  }
+  
+  // CCS811
+  if (checkI2CDevice(0x5A)) {
+    if (myCCS811.begin()) {
+      ccs811Available = true;
+      Serial.println(F("CCS811 inicializado"));
+    } else {
+      Serial.println(F("Error inicializando CCS811"));
+    }
+  } else {
+    Serial.println(F("CCS811 no detectado"));
+  }
+
+  // DS18B20
+  sensorDS18B20.begin();
+  Serial.println(F("DS18B20 inicializado"));
+}
+
+bool checkI2CDevice(byte address) {
+  Wire.beginTransmission(address);
+  byte error = Wire.endTransmission();
+  return (error == 0);
+}
+
+void loop() {
+  readSensors();
+  printData();
+  delay(2000); // cada 2 segundos
+}
+
+float readMQ7Rs() {
+  int adc_MQ = analogRead(MQ7_ANALOG_PIN);
+  if (adc_MQ == 0) return 0;
+
+  float voltaje_esp32 = adc_MQ * (3.3 / 4095.0);
+  float voltaje_MQ7 = voltaje_esp32 * (R1 + R2) / R2;
+  return RL * (VCC_MQ7 - voltaje_MQ7) / voltaje_MQ7;
+}
+
+void readSensors() {
+  if (hdc1080Available) {
+    tempC = myHDC1080.readTemperature();
+    hum = myHDC1080.readHumidity();
+  }
+
+  if (ccs811Available && myCCS811.dataAvailable()) {
+    myCCS811.readAlgorithmResults();
+    co2 = myCCS811.getCO2();
+    tvoc = myCCS811.getTVOC();
+    if (hdc1080Available) myCCS811.setEnvironmentalData(hum, tempC);
+  }
+
+  if (bh1750Available) {
+    lux = lightMeter.readLightLevel();
+  }
+
+  Rs = readMQ7Rs();
+  if (Rs > 0) {
+    float ratio = Rs / RS_BASE_LINE;
+    co = CO_BASE_LINE * pow(ratio, -2.5);
+  }
+
+  sensorDS18B20.requestTemperatures();
+  temp2 = sensorDS18B20.getTempCByIndex(0);
+}
+
+void printData() {
+  myRTC.updateTime();
+
+  Serial.print(myRTC.dayofmonth); Serial.print("/");
+  Serial.print(myRTC.month); Serial.print("/");
+  Serial.print(myRTC.year); Serial.print(",");
+
+  Serial.printf("%02d:%02d:%02d,", myRTC.hours, myRTC.minutes, myRTC.seconds);
+
+  Serial.print(tempC, 2); Serial.print(",");
+  Serial.print(hum, 2); Serial.print(",");
+  Serial.print(co2); Serial.print(",");
+  Serial.print(tvoc); Serial.print(",");
+  Serial.print(co, 1); Serial.print(",");
+  Serial.print(lux, 0); Serial.print(",");
+  Serial.println(temp2, 2);
+}
